@@ -1,4 +1,6 @@
-%% Copyright (c) 2011-2012 Basho Technologies, Inc.  All Rights Reserved.
+%% -------------------------------------------------------------------
+%%
+%% Copyright (c) 2011-2017 Basho Technologies, Inc.
 %%
 %% This file is provided to you under the Apache License,
 %% Version 2.0 (the "License"); you may not use this file
@@ -13,18 +15,25 @@
 %% KIND, either express or implied.  See the License for the
 %% specific language governing permissions and limitations
 %% under the License.
+%%
+%% -------------------------------------------------------------------
 
 -module(lager_util).
 
 -include_lib("kernel/include/file.hrl").
 
--export([levels/0, level_to_num/1, num_to_level/1, config_to_mask/1, config_to_levels/1, mask_to_levels/1,
-        open_logfile/2, ensure_logfile/4, rotate_logfile/2, format_time/0, format_time/1,
-        localtime_ms/0, localtime_ms/1, maybe_utc/1, parse_rotation_date_spec/1,
-        calculate_next_rotation/1, validate_trace/1, check_traces/4, is_loggable/3,
-        trace_filter/1, trace_filter/2]).
+-export([
+    levels/0, level_to_num/1, level_to_chr/1,
+    num_to_level/1, config_to_mask/1, config_to_levels/1, mask_to_levels/1,
+    open_logfile/2, ensure_logfile/4, rotate_logfile/2, format_time/0, format_time/1,
+    localtime_ms/0, localtime_ms/1, maybe_utc/1, parse_rotation_date_spec/1,
+    calculate_next_rotation/1, validate_trace/1, check_traces/4, is_loggable/3,
+    trace_filter/1, trace_filter/2, expand_path/1, find_file/2, check_hwm/1, check_hwm/2,
+    make_internal_sink_name/1, otp_version/0
+]).
 
 -ifdef(TEST).
+-export([create_test_dir/0, delete_test_dir/1]).
 -include_lib("eunit/include/eunit.hrl").
 -endif.
 
@@ -33,25 +42,35 @@
 levels() ->
     [debug, info, notice, warning, error, critical, alert, emergency, none].
 
-level_to_num(debug)     -> ?DEBUG;
-level_to_num(info)      -> ?INFO;
-level_to_num(notice)    -> ?NOTICE;
-level_to_num(warning)   -> ?WARNING;
-level_to_num(error)     -> ?ERROR;
-level_to_num(critical)  -> ?CRITICAL;
-level_to_num(alert)     -> ?ALERT;
-level_to_num(emergency) -> ?EMERGENCY;
-level_to_num(none)      -> ?LOG_NONE.
+level_to_num(debug)      -> ?DEBUG;
+level_to_num(info)       -> ?INFO;
+level_to_num(notice)     -> ?NOTICE;
+level_to_num(warning)    -> ?WARNING;
+level_to_num(error)      -> ?ERROR;
+level_to_num(critical)   -> ?CRITICAL;
+level_to_num(alert)      -> ?ALERT;
+level_to_num(emergency)  -> ?EMERGENCY;
+level_to_num(none)       -> ?LOG_NONE.
 
-num_to_level(?DEBUG) -> debug;
-num_to_level(?INFO) -> info;
-num_to_level(?NOTICE) -> notice;
-num_to_level(?WARNING) -> warning;
-num_to_level(?ERROR) -> error;
-num_to_level(?CRITICAL) -> critical;
-num_to_level(?ALERT) -> alert;
+level_to_chr(debug)      -> $D;
+level_to_chr(info)       -> $I;
+level_to_chr(notice)     -> $N;
+level_to_chr(warning)    -> $W;
+level_to_chr(error)      -> $E;
+level_to_chr(critical)   -> $C;
+level_to_chr(alert)      -> $A;
+level_to_chr(emergency)  -> $M;
+level_to_chr(none)       -> $ .
+
+num_to_level(?DEBUG)     -> debug;
+num_to_level(?INFO)      -> info;
+num_to_level(?NOTICE)    -> notice;
+num_to_level(?WARNING)   -> warning;
+num_to_level(?ERROR)     -> error;
+num_to_level(?CRITICAL)  -> critical;
+num_to_level(?ALERT)     -> alert;
 num_to_level(?EMERGENCY) -> emergency;
-num_to_level(?LOG_NONE) -> none.
+num_to_level(?LOG_NONE)  -> none.
 
 -spec config_to_mask(atom()|string()) -> {'mask', integer()}.
 config_to_mask(Conf) ->
@@ -357,7 +376,7 @@ calculate_next_rotation([{date, Date}|T], {{Year, Month, Day}, _} = Now) ->
 trace_filter(Query) ->
     trace_filter(?DEFAULT_TRACER, Query).
 
-%% TODO: Support multiple trace modules 
+%% TODO: Support multiple trace modules
 %-spec trace_filter(Module :: atom(), Query :: 'none' | [tuple()]) -> {ok, any()}.
 trace_filter(Module, Query) when Query == none; Query == [] ->
     {ok, _} = glc:compile(Module, glc:null(false));
@@ -389,44 +408,56 @@ validate_trace(_) ->
 
 validate_trace_filter(Filter) when is_tuple(Filter), is_atom(element(1, Filter)) =:= false ->
     false;
-validate_trace_filter(Filter) ->
-        case lists:all(fun({Key, '*'}) when is_atom(Key) -> true; 
-                          ({Key, '!'}) when is_atom(Key) -> true;
-                          ({Key, _Value})      when is_atom(Key) -> true;
-                          ({Key, '=', _Value}) when is_atom(Key) -> true;
-                          ({Key, '<', _Value}) when is_atom(Key) -> true;
-                          ({Key, '>', _Value}) when is_atom(Key) -> true;
-                          (_) -> false end, Filter) of
-            true ->
-                true;
-            _ ->
-                false
-        end.
+validate_trace_filter(Filter) when is_list(Filter) ->
+    lists:all(fun validate_trace_filter/1, Filter);
+validate_trace_filter({Key, '*'}) when is_atom(Key) -> true;
+validate_trace_filter({any, L}) when is_list(L) -> lists:all(fun validate_trace_filter/1, L);
+validate_trace_filter({all, L}) when is_list(L) -> lists:all(fun validate_trace_filter/1, L);
+validate_trace_filter({null, Bool}) when is_boolean(Bool) -> true;
+validate_trace_filter({Key, _Value})      when is_atom(Key) -> true;
+validate_trace_filter({Key, '=', _Value}) when is_atom(Key) -> true;
+validate_trace_filter({Key, '!=', _Value}) when is_atom(Key) -> true;
+validate_trace_filter({Key, '<', _Value}) when is_atom(Key) -> true;
+validate_trace_filter({Key, '=<', _Value}) when is_atom(Key) -> true;
+validate_trace_filter({Key, '>', _Value}) when is_atom(Key) -> true;
+validate_trace_filter({Key, '>=', _Value}) when is_atom(Key) -> true;
+validate_trace_filter(_) -> false.
 
-trace_all(Query) -> 
-	glc:all(trace_acc(Query)).
+trace_all(Query) ->
+    glc:all(trace_acc(Query)).
 
-trace_any(Query) -> 
-	glc:any(Query).
+trace_any(Query) ->
+    glc:any(Query).
 
 trace_acc(Query) ->
     trace_acc(Query, []).
 
-trace_acc([], Acc) -> 
-	lists:reverse(Acc);
+trace_acc([], Acc) ->
+    lists:reverse(Acc);
+trace_acc([{any, L}|T], Acc) ->
+    trace_acc(T, [glc:any(L)|Acc]);
+trace_acc([{all, L}|T], Acc) ->
+    trace_acc(T, [glc:all(L)|Acc]);
+trace_acc([{null, Bool}|T], Acc) ->
+    trace_acc(T, [glc:null(Bool)|Acc]);
 trace_acc([{Key, '*'}|T], Acc) ->
-	trace_acc(T, [glc:wc(Key)|Acc]);
+    trace_acc(T, [glc:wc(Key)|Acc]);
 trace_acc([{Key, '!'}|T], Acc) ->
-	trace_acc(T, [glc:nf(Key)|Acc]);
+    trace_acc(T, [glc:nf(Key)|Acc]);
 trace_acc([{Key, Val}|T], Acc) ->
-	trace_acc(T, [glc:eq(Key, Val)|Acc]);
+    trace_acc(T, [glc:eq(Key, Val)|Acc]);
 trace_acc([{Key, '=', Val}|T], Acc) ->
-	trace_acc(T, [glc:eq(Key, Val)|Acc]);
+    trace_acc(T, [glc:eq(Key, Val)|Acc]);
+trace_acc([{Key, '!=', Val}|T], Acc) ->
+    trace_acc(T, [glc:neq(Key, Val)|Acc]);
 trace_acc([{Key, '>', Val}|T], Acc) ->
-	trace_acc(T, [glc:gt(Key, Val)|Acc]);
+    trace_acc(T, [glc:gt(Key, Val)|Acc]);
+trace_acc([{Key, '>=', Val}|T], Acc) ->
+    trace_acc(T, [glc:gte(Key, Val)|Acc]);
+trace_acc([{Key, '=<', Val}|T], Acc) ->
+    trace_acc(T, [glc:lte(Key, Val)|Acc]);
 trace_acc([{Key, '<', Val}|T], Acc) ->
-	trace_acc(T, [glc:lt(Key, Val)|Acc]).
-	
+    trace_acc(T, [glc:lt(Key, Val)|Acc]).
 
 check_traces(_, _,  [], Acc) ->
     lists:flatten(Acc);
@@ -445,10 +476,10 @@ check_trace(Attrs, {Filter, _Level, Dest}) when is_tuple(Filter) ->
     glc:handle(?DEFAULT_TRACER, Made),
     Match = glc_lib:matches(Filter, Made),
     case Match of
-	true ->
-	    Dest;
-	false ->
-	    []
+        true ->
+            Dest;
+        false ->
+            []
     end.
 
 -spec is_loggable(lager_msg:lager_msg(), non_neg_integer()|{'mask', non_neg_integer()}, term()) -> boolean().
@@ -466,6 +497,119 @@ i2l(I) when I < 10  -> [$0, $0+I];
 i2l(I)              -> integer_to_list(I).
 i3l(I) when I < 100 -> [$0 | i2l(I)];
 i3l(I)              -> integer_to_list(I).
+
+%% When log_root option is provided, get the real path to a file
+expand_path(RelPath) ->
+    case application:get_env(lager, log_root) of
+        {ok, LogRoot} when is_list(LogRoot) -> % Join relative path
+            %% check if the given RelPath contains LogRoot, if so, do not add
+            %% it again; see gh #304
+            case string:str(filename:dirname(RelPath), LogRoot) of
+                X when X > 0 ->
+                    RelPath;
+                _Zero ->
+                    filename:join(LogRoot, RelPath)
+            end;
+        undefined -> % No log_root given, keep relative path
+            RelPath
+    end.
+
+%% Find a file among the already installed handlers.
+%%
+%% The file is already expanded (i.e. lager_util:expand_path already added the
+%% "log_root"), but the file paths inside Handlers are not.
+find_file(_File1, _Handlers = []) ->
+    false;
+find_file(File1, [{{lager_file_backend, File2}, _Handler, _Sink} = HandlerInfo | Handlers]) ->
+    File1Abs = filename:absname(File1),
+    File2Abs = filename:absname(lager_util:expand_path(File2)),
+    case File1Abs =:= File2Abs of
+        true ->
+            % The file inside HandlerInfo is the same as the file we are looking
+            % for, so we are done.
+            HandlerInfo;
+        false ->
+            find_file(File1, Handlers)
+    end;
+find_file(File1, [_HandlerInfo | Handlers]) ->
+    find_file(File1, Handlers).
+
+%% conditionally check the HWM if the event would not have been filtered
+check_hwm(Shaper = #lager_shaper{filter = Filter}, Event) ->
+    case Filter(Event) of
+        true ->
+            {true, 0, Shaper};
+        false ->
+            check_hwm(Shaper)
+    end.
+
+%% Log rate limit, i.e. high water mark for incoming messages
+
+check_hwm(Shaper = #lager_shaper{hwm = undefined}) ->
+    {true, 0, Shaper};
+check_hwm(Shaper = #lager_shaper{mps = Mps, hwm = Hwm}) when Mps < Hwm ->
+    %% haven't hit high water mark yet, just log it
+    {true, 0, Shaper#lager_shaper{mps=Mps+1}};
+check_hwm(Shaper = #lager_shaper{lasttime = Last, dropped = Drop}) ->
+    %% are we still in the same second?
+    {M, S, _} = Now = os:timestamp(),
+    case Last of
+        {M, S, N} ->
+            %% still in same second, but have exceeded the high water mark
+            NewDrops = discard_messages(Now, Shaper#lager_shaper.filter, 0),
+            Timer = case erlang:read_timer(Shaper#lager_shaper.timer) of
+                        false ->
+                            erlang:send_after(trunc((1000000 - N)/1000), self(), {shaper_expired, Shaper#lager_shaper.id});
+                        _ ->
+                            Shaper#lager_shaper.timer
+                    end,
+            {false, 0, Shaper#lager_shaper{dropped=Drop+NewDrops, timer=Timer}};
+        _ ->
+            erlang:cancel_timer(Shaper#lager_shaper.timer),
+            %% different second, reset all counters and allow it
+            {true, Drop, Shaper#lager_shaper{dropped = 0, mps=1, lasttime = Now}}
+    end.
+
+discard_messages(Second, Filter, Count) ->
+    {M, S, _} = os:timestamp(),
+    case Second of
+        {M, S, _} ->
+            receive
+                %% we only discard gen_event notifications, because
+                %% otherwise we might discard gen_event internal
+                %% messages, such as trapped EXITs
+                {notify, Event} ->
+                    NewCount = case Filter(Event) of
+                                   false -> Count+1;
+                                   true -> Count
+                               end,
+                    discard_messages(Second, Filter, NewCount)
+            after 0 ->
+                    Count
+            end;
+        _ ->
+            Count
+    end.
+
+%% @private Build an atom for the gen_event process based on a sink name.
+%% For historical reasons, the default gen_event process for lager itself is named
+%% `lager_event'. For all other sinks, it is SinkName++`_lager_event'
+make_internal_sink_name(lager) ->
+    ?DEFAULT_SINK;
+make_internal_sink_name(Sink) ->
+    list_to_atom(atom_to_list(Sink) ++ "_lager_event").
+
+-spec otp_version() -> pos_integer().
+%% @doc Return the major version of the current Erlang/OTP runtime as an integer.
+otp_version() ->
+    {Vsn, _} = string:to_integer(
+        case erlang:system_info(otp_release) of
+            [$R | Rel] ->
+                Rel;
+            Rel ->
+                Rel
+        end),
+    Vsn.
 
 -ifdef(TEST).
 
@@ -542,49 +686,52 @@ rotation_calculation_test() ->
 
     ?assertMatch({{2000, 1, 7}, {16, 0, 0}},
         calculate_next_rotation([{day, 5}, {hour, 16}], {{2000, 1, 3}, {17, 34, 43}})),
-    
+
     ?assertMatch({{2000, 1, 3}, {16, 0, 0}},
         calculate_next_rotation([{day, 1}, {hour, 16}], {{1999, 12, 28}, {17, 34, 43}})),
     ok.
 
 rotate_file_test() ->
-    file:delete("rotation.log"),
-    [file:delete(["rotation.log.", integer_to_list(N)]) || N <- lists:seq(0, 9)],
-    [begin
-                file:write_file("rotation.log", integer_to_list(N)),
-                Count = case N > 10 of
-                    true -> 10;
-                    _ -> N
-                end,
-                [begin
-                            FileName = ["rotation.log.", integer_to_list(M)],
-                            ?assert(filelib:is_regular(FileName)),
-                            %% check the expected value is in the file
-                            Number = list_to_binary(integer_to_list(N - M - 1)),
-                            ?assertEqual({ok, Number}, file:read_file(FileName))
-                end
-                || M <- lists:seq(0, Count-1)],
-                rotate_logfile("rotation.log", 10)
-    end || N <- lists:seq(0, 20)].
+    RotCount = 10,
+    TestDir = create_test_dir(),
+    TestLog = filename:join(TestDir, "rotation.log"),
+    Outer = fun(N) ->
+        ?assertEqual(ok, file:write_file(TestLog, erlang:integer_to_list(N))),
+        Inner = fun(M) ->
+            File = lists:flatten([TestLog, $., erlang:integer_to_list(M)]),
+            ?assert(filelib:is_regular(File)),
+            %% check the expected value is in the file
+            Number = erlang:list_to_binary(integer_to_list(N - M - 1)),
+            ?assertEqual({ok, Number}, file:read_file(File))
+        end,
+        Count = erlang:min(N, RotCount),
+        % The first time through, Count == 0, so the sequence is empty,
+        % effectively skipping the inner loop so a rotation can occur that
+        % creates the file that Inner looks for.
+        % Don't shoot the messenger, it was worse before this refactoring.
+        lists:foreach(Inner, lists:seq(0, Count-1)),
+        rotate_logfile(TestLog, RotCount)
+    end,
+    lists:foreach(Outer, lists:seq(0, (RotCount * 2))),
+    delete_test_dir(TestDir).
 
 rotate_file_fail_test() ->
-    %% make sure the directory exists
-    ?assertEqual(ok, filelib:ensure_dir("rotation/rotation.log")),
-    %% fix the permissions on it
-    os:cmd("chown -R u+rwx rotation"),
-    %% delete any old files
-    [ok = file:delete(F) || F <- filelib:wildcard("rotation/*")],
+    TestDir = create_test_dir(),
+    TestLog = filename:join(TestDir, "rotation.log"),
+    %% set known permissions on it
+    os:cmd("chmod -R u+rwx " ++ TestDir),
     %% write a file
-    file:write_file("rotation/rotation.log", "hello"),
+    file:write_file(TestLog, "hello"),
     %% hose up the permissions
-    os:cmd("chown u-w rotation"),
-    ?assertMatch({error, _}, rotate_logfile("rotation.log", 10)),
-    ?assert(filelib:is_regular("rotation/rotation.log")),
-    os:cmd("chown u+w rotation"),
-    ?assertMatch(ok, rotate_logfile("rotation/rotation.log", 10)),
-    ?assert(filelib:is_regular("rotation/rotation.log.0")),
-    ?assertEqual(false, filelib:is_regular("rotation/rotation.log")),
-    ok.
+    os:cmd("chmod u-w " ++ TestDir),
+    ?assertMatch({error, _}, rotate_logfile(TestLog, 10)),
+    ?assert(filelib:is_regular(TestLog)),
+    %% fix the permissions
+    os:cmd("chmod u+w " ++ TestDir),
+    ?assertMatch(ok, rotate_logfile(TestLog, 10)),
+    ?assert(filelib:is_regular(TestLog ++ ".0")),
+    ?assertEqual(false, filelib:is_regular(TestLog)),
+    delete_test_dir(TestDir).
 
 check_trace_test() ->
     lager:start(),
@@ -706,5 +853,65 @@ mask_to_levels_test() ->
     ?assertEqual([debug, info, emergency], mask_to_levels(2#11000001)),
     ?assertEqual([debug, notice, error], mask_to_levels(?DEBUG bor ?NOTICE bor ?ERROR)),
     ok.
+
+expand_path_test() ->
+    OldRootVal = application:get_env(lager, log_root),
+
+    ok = application:unset_env(lager, log_root),
+    ?assertEqual("/foo/bar", expand_path("/foo/bar")),
+    ?assertEqual("foo/bar", expand_path("foo/bar")),
+
+    ok = application:set_env(lager, log_root, "log/dir"),
+    ?assertEqual("/foo/bar", expand_path("/foo/bar")), % Absolute path should not be changed
+    ?assertEqual("log/dir/foo/bar", expand_path("foo/bar")),
+    ?assertEqual("log/dir/foo/bar", expand_path("log/dir/foo/bar")), %% gh #304
+
+    case OldRootVal of
+        undefined -> application:unset_env(lager, log_root);
+        {ok, Root} -> application:set_env(lager, log_root, Root)
+    end,
+    ok.
+
+sink_name_test_() ->
+    [
+        ?_assertEqual(lager_event, make_internal_sink_name(lager)),
+        ?_assertEqual(audit_lager_event, make_internal_sink_name(audit))
+    ].
+
+create_test_dir() ->
+    Dir = filename:join(["/tmp", "lager_test",
+        erlang:integer_to_list(erlang:phash2(os:timestamp()))]),
+    ?assertEqual(ok, filelib:ensure_dir(Dir)),
+    case file:make_dir(Dir) of
+        ok ->
+            Dir;
+        Err ->
+            ?assertEqual({error, eexist}, Err),
+            create_test_dir()
+    end.
+
+delete_test_dir(Dir) ->
+    case otp_version() of
+        15 ->
+            os:cmd("rm -rf " ++ Dir);
+        _ ->
+            do_delete_test_dir(Dir)
+    end.
+
+do_delete_test_dir(Dir) ->
+    ListRet = file:list_dir_all(Dir),
+    ?assertMatch({ok, _}, ListRet),
+    {_, Entries} = ListRet,
+    lists:foreach(
+        fun(Entry) ->
+            FsElem = filename:join(Dir, Entry),
+            case filelib:is_dir(FsElem) of
+                true ->
+                    delete_test_dir(FsElem);
+                _ ->
+                    ?assertEqual(ok, file:delete(FsElem))
+            end
+        end, Entries),
+    ?assertEqual(ok, file:del_dir(Dir)).
 
 -endif.
